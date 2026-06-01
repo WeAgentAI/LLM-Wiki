@@ -1,0 +1,8 @@
+# Knowledge page type registry for benchmark datasets
+# First ingestion: LLM automatically analyzes article samples and generates directory structure
+# New types are auto-appended to this file and corresponding directories are created
+#
+# Each type's description is shown to LLM to help it decide which directory to browse
+# Similar to skill description, it's the first layer of a two-level index
+
+page_types: {}

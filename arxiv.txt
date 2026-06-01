@@ -1,0 +1,12 @@
+Title : Retrieval as Reasoning: Self-Evolving Agent-Native Retrieval via LLM-Wiki
+arXiv : https://arxiv.org/abs/2605.25480
+
+@misc{ming2026retrievalreasoningselfevolvingagentnative,
+      title={Retrieval as Reasoning: Self-Evolving Agent-Native Retrieval via LLM-Wiki},
+      author={Haoliang Ming and Feifei Li and Xiaoqing Wu and Wenhui Que},
+      year={2026},
+      eprint={2605.25480},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2605.25480},
+}
