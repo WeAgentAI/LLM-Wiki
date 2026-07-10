@@ -24,17 +24,12 @@ from pathlib import Path
 
 # ─── Path setup ───
 BENCH_DIR = Path(__file__).parent
-WIKI_ENGINE_DIR = BENCH_DIR.parent / "LLM_WiKi"
 
 # Use bench_config in place of the engine config.
 import bench_config as config
 
 # Import the LLM client first (it reads bench_config and has full retry logic).
 from llm_client import call_llm, call_llm_json
-
-# Add the engine directory to sys.path so other modules can import from it.
-if str(WIKI_ENGINE_DIR) not in sys.path:
-    sys.path.insert(0, str(WIKI_ENGINE_DIR))
 
 # Error-book module.
 import bench_error_book as error_book
@@ -4118,7 +4113,8 @@ def _extract_entry_name(entry_line: str) -> str:
     return name.rsplit("/", 1)[-1]
 
 
-def relocate_pending_entries(dry_run: bool = False, batch_size: int = 40) -> dict:
+def relocate_pending_entries(dry_run: bool = False, batch_size: int = 40,
+                             force_final: bool = False) -> dict:
     """Move entries from each directory's "## Unsorted" section into existing sections (or propose new sections).
 
     Algorithm:
@@ -4130,6 +4126,15 @@ def relocate_pending_entries(dry_run: bool = False, batch_size: int = 40) -> dic
       3. Rewrite ``_index.md`` according to the LLM's decisions: entries move
          to the end of the chosen section; new sections are inserted right
          before ``## Unsorted``; undecided entries stay in ``## Unsorted``.
+
+    Args:
+        force_final: final-pass fallback. With the default ``False``, a directory
+            whose total entries are ``<=3`` *and* which has no existing sections is
+            skipped (to save LLM calls) and left in "Unsorted" — reasonable during
+            periodic maintenance (classify later once more entries accrue). But if
+            every pass skips them, such entries stay stuck in "Unsorted" forever.
+            The ``finalize_wiki`` step should call this once with
+            ``force_final=True`` so these few entries are still classified.
     """
     summary = {"dirs_processed": 0, "moved": 0, "new_sections": 0, "left_pending": 0, "details": []}
 
@@ -4190,7 +4195,7 @@ def relocate_pending_entries(dry_run: bool = False, batch_size: int = 40) -> dic
         suggested_min = int(suggested_range.split("-")[0])
         suggested_max = int(suggested_range.split("-")[-1])
 
-        if total_entries <= 3:
+        if total_entries <= 3 and not force_final:
             if existing_sections:
                 target_sec = existing_sections[0]
                 print(f"    ⏭️  Too few entries ({total_entries}), moving to「{target_sec}」, skip LLM")
@@ -4860,6 +4865,18 @@ def finalize_wiki():
             print(f"    ℹ️ {reason}")
     except Exception as e:
         print(f"    ⚠️ Directory audit failed: {e}")
+
+    # Final forced relocation of leftover "## Unsorted" entries (including
+    # directories with <=3 entries and no existing sections, which periodic
+    # maintenance skips; force_final=True classifies them so they do not stay
+    # stuck in Unsorted forever).
+    print(f"\n  📋 Final Unsorted relocation (force)...")
+    try:
+        final_relocate = relocate_pending_entries(dry_run=False, force_final=True)
+        if final_relocate["moved"] > 0:
+            print(f"    📑 Force-relocated {final_relocate['moved']} entries from Unsorted")
+    except Exception as e:
+        print(f"    ⚠️ Final relocation failed: {e}")
 
     print(f"\n  📋 Rebuild indexes...")
     _rebuild_sources_index()

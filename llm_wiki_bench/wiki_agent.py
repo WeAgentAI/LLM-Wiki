@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -77,6 +78,7 @@ class RetrievalResult:
     trace: list[str] = field(default_factory=list)               # human-readable log
     tool_calls: list[dict] = field(default_factory=list)         # raw call log
     total_calls: int = 0
+    search_top_results: list[str] = field(default_factory=list)  # top search-hit paths (for fallbacks)
 
 
 # ─── Agent ────────────────────────────────────────────────────────────────
@@ -147,8 +149,9 @@ class WikiAgent:
             tool_calls = assistant_msg.get("tool_calls") or []
 
             if not tool_calls:
-                # Agent decided to answer. Enforce the "at least one wiki_read" contract.
-                if not result.pages and result.total_calls < self.t_max:
+                # Agent decided to answer. Enforce the "at least one wiki_read" contract:
+                # only nudge if it has search hits it could still read.
+                if not result.pages and result.search_top_results and result.total_calls < self.t_max:
                     if self.verbose:
                         print("  [agent] reminder: must call wiki_read before answering")
                     messages.append({
@@ -171,6 +174,47 @@ class WikiAgent:
                 if self.verbose:
                     print(f"  [agent] {consecutive_empty} consecutive empty searches; stopping")
                 break
+
+        # ── Fallback 1: agent stopped without reading any page, but search had hits.
+        # Auto-read the top search results so the answer step is not left empty.
+        if not result.pages and result.search_top_results:
+            fallback_paths = result.search_top_results[:3]
+            if self.verbose:
+                print(f"  [agent] fallback: read top search results {fallback_paths}")
+            result.trace.append(f"[fallback] auto-read top search results: {', '.join(fallback_paths)}")
+            for rp in fallback_paths:
+                self._add_page(rp, result)
+
+        # ── Fallback 2: only one page read for a likely multi-hop question.
+        # Follow the first page's links_to (preferring pages that also appeared in
+        # search hits) to auto-read a second hop.
+        elif len(result.pages) == 1 and self._is_likely_multihop(question):
+            first_page = next(iter(result.pages_meta.values()), None)
+            linked_paths: set[str] = set()
+            if first_page is not None:
+                for link in first_page.links_to:
+                    link_path = link if link.endswith(".md") else link + ".md"
+                    page = self.retriever.pages.get(link_path)
+                    if page is None or link_path in result.pages_text:
+                        continue
+                    if not str(getattr(page, "dir_name", "")).startswith("sources"):
+                        linked_paths.add(link_path)
+
+            overlap = [rp for rp in result.search_top_results if rp in linked_paths]
+            fallback_candidates = overlap if overlap else list(linked_paths)[:3]
+            if not fallback_candidates:
+                fallback_candidates = [
+                    rp for rp in result.search_top_results
+                    if rp not in result.pages_text
+                    and not str(getattr(self.retriever.pages.get(rp), "dir_name", "")).startswith("sources")
+                ][:2]
+
+            if fallback_candidates:
+                if self.verbose:
+                    print(f"  [agent] fallback (2nd hop): read {fallback_candidates[:2]}")
+                result.trace.append(f"[fallback-2hop] auto-read for 2nd hop: {', '.join(fallback_candidates[:2])}")
+                for rp in fallback_candidates[:2]:
+                    self._add_page(rp, result)
 
         if self.verbose:
             print(
@@ -211,6 +255,11 @@ class WikiAgent:
                 else:
                     top = ", ".join(r["name"] for r in payload.get("results", [])[:3])
                     result.trace.append(f'search "{args.get("query", "")}" → {matched} results (top: {top})')
+                    # Track top hit paths for the post-loop fallbacks.
+                    for r in payload.get("results", [])[:3]:
+                        rp = r.get("path") or r.get("dir", "")
+                        if rp and rp not in result.search_top_results:
+                            result.search_top_results.append(rp)
             except json.JSONDecodeError:
                 pass
         elif name == "wiki_read":
@@ -248,3 +297,48 @@ class WikiAgent:
                 else:
                     break
         return count
+
+    def _add_page(self, rel_path: str, result: RetrievalResult) -> None:
+        """Add a page (by rel_path) into the result if present and not already read."""
+        page = self.retriever.pages.get(rel_path)
+        if page is None or rel_path in result.pages_text:
+            return
+        result.pages.append((rel_path, page.name))
+        result.pages_text[rel_path] = page.text
+        result.pages_meta[rel_path] = page
+
+    def _is_likely_multihop(self, question: str) -> bool:
+        """Heuristically decide whether a question likely needs 2+ entity pages.
+
+        Pattern-based (no LLM): comparison keywords, nested bridge patterns, or
+        the presence of 2+ distinct proper-noun phrases.
+        """
+        q = question.lower()
+
+        comparison_keywords = [
+            "both", "same country", "same nationality", "same city",
+            "which is older", "which is younger", "which is larger",
+            "which is smaller", "who is older", "who is younger",
+            "do both", "are both", "were both", "did both",
+        ]
+        if any(kw in q for kw in comparison_keywords):
+            return True
+
+        bridge_patterns = [
+            r"the \w+ of the \w+ of",
+            r"the \w+ of the \w+ that",
+            r"the \w+ of the \w+ who",
+            r"where .+ was born",
+            r"who directed the film",
+            r"the \w+ where .+ (was|is|were)",
+            r"the \w+ that .+ (directed|wrote|starred|produced|founded)",
+        ]
+        if any(re.search(pat, q) for pat in bridge_patterns):
+            return True
+
+        proper_nouns = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', question)
+        unique_nouns = {pn.lower() for pn in proper_nouns}
+        noise_words = {"what", "where", "when", "who", "which", "how",
+                       "does", "did", "are", "is", "was", "were"}
+        unique_nouns -= noise_words
+        return len(unique_nouns) >= 2
